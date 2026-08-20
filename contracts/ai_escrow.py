@@ -3,27 +3,19 @@
 from genlayer import *
 
 
-class EscrowRecipient(gl.Contract):
-    owner: Address
+@gl.evm.contract_interface
+class Recipient:
+    class View:
+        pass
 
-    def __init__(self):
-        self.owner = gl.message.sender_address
-
-    @gl.public.write
-    def receive(self) -> None:
-        if gl.message.value == u256(0):
-            raise gl.vm.UserError("VALUE_REQUIRED")
-
-    @gl.public.view
-    def get_owner(self) -> Address:
-        return self.owner
+    class Write:
+        pass
 
 
 class EscrowPrimitive(gl.Contract):
     depositor: Address
     beneficiary: Address
     amount: u256
-    recipient: Address
     release_url: str
     release_marker: str
     status: str
@@ -32,7 +24,6 @@ class EscrowPrimitive(gl.Contract):
         self,
         beneficiary: Address,
         amount: u256,
-        recipient: Address,
         release_url: str,
         release_marker: str,
     ):
@@ -45,7 +36,6 @@ class EscrowPrimitive(gl.Contract):
         self.depositor = gl.message.sender_address
         self.beneficiary = beneficiary
         self.amount = amount
-        self.recipient = recipient
         self.release_url = release_url
         self.release_marker = release_marker
         self.status = "CREATED"
@@ -88,9 +78,8 @@ class EscrowPrimitive(gl.Contract):
         if not self._verify_release_condition():
             raise gl.vm.UserError("RELEASE_CONDITION_NOT_VERIFIED")
 
-        gl.get_contract_at(self.recipient).emit_transfer(
+        Recipient(self.beneficiary).emit_transfer(
             value=self.amount,
-            on="finalized",
         )
 
         self.status = "RELEASED"
@@ -109,9 +98,8 @@ class EscrowPrimitive(gl.Contract):
         if self._verify_release_condition():
             raise gl.vm.UserError("RELEASE_CONDITION_IS_VERIFIED")
 
-        gl.get_contract_at(self.recipient).emit_transfer(
+        Recipient(self.depositor).emit_transfer(
             value=self.amount,
-            on="finalized",
         )
 
         self.status = "REFUNDED"
@@ -135,7 +123,3 @@ class EscrowPrimitive(gl.Contract):
     @gl.public.view
     def get_beneficiary(self) -> Address:
         return self.beneficiary
-
-    @gl.public.view
-    def get_recipient(self) -> Address:
-        return self.recipient
