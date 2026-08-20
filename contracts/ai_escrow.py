@@ -3,6 +3,15 @@
 from genlayer import *
 
 
+@gl.evm.contract_interface
+class Recipient:
+    class View:
+        pass
+
+    class Write:
+        pass
+
+
 class EscrowPrimitive(gl.Contract):
     depositor: Address
     beneficiary: Address
@@ -69,8 +78,7 @@ class EscrowPrimitive(gl.Contract):
         if not self._verify_release_condition():
             raise gl.vm.UserError("RELEASE_CONDITION_NOT_VERIFIED")
 
-        self.emit_transfer(
-            to=self.beneficiary,
+        Recipient(self.beneficiary).emit_transfer(
             value=self.amount,
         )
 
@@ -90,8 +98,7 @@ class EscrowPrimitive(gl.Contract):
         if self._verify_release_condition():
             raise gl.vm.UserError("RELEASE_CONDITION_IS_VERIFIED")
 
-        self.emit_transfer(
-            to=self.depositor,
+        Recipient(self.depositor).emit_transfer(
             value=self.amount,
         )
 
