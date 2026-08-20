@@ -1,10 +1,33 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 from genlayer import *
+import json
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise gl.vm.UserError(message)
+
+
+def parse_json_response(text: str) -> dict:
+    text = text.strip()
+
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1:
+        raise gl.vm.UserError("INVALID_ADJUDICATION_RESPONSE")
+
+    return json.loads(text[start:end + 1])
 
 
 @gl.evm.contract_interface
-class Recipient:
+class _NativeRecipient:
     class View:
         pass
 
@@ -12,97 +35,261 @@ class Recipient:
         pass
 
 
-class EscrowPrimitive(gl.Contract):
+def send_native(recipient: Address, amount: u256) -> None:
+    _NativeRecipient(recipient).emit_transfer(
+        value=amount
+    )
+
+
+class IntelligentEscrow(gl.Contract):
     depositor: Address
     beneficiary: Address
+
     amount: u256
-    release_url: str
-    release_marker: str
+
+    evidence_url: str
+    release_condition: str
+
     status: str
+    claimable: TreeMap[Address, u256]
 
     def __init__(
         self,
         beneficiary: Address,
         amount: u256,
-        release_url: str,
-        release_marker: str,
+        evidence_url: str,
+        release_condition: str,
     ):
-        if amount == u256(0):
-            raise gl.vm.UserError("ESCROW_AMOUNT_MUST_BE_POSITIVE")
+        require(
+            amount > u256(0),
+            "ESCROW_AMOUNT_MUST_BE_POSITIVE"
+        )
 
-        if release_marker == "":
-            raise gl.vm.UserError("RELEASE_MARKER_REQUIRED")
+        require(
+            len(evidence_url.strip()) > 0,
+            "EVIDENCE_URL_REQUIRED"
+        )
+
+        require(
+            len(release_condition.strip()) > 0,
+            "RELEASE_CONDITION_REQUIRED"
+        )
 
         self.depositor = gl.message.sender_address
         self.beneficiary = beneficiary
         self.amount = amount
-        self.release_url = release_url
-        self.release_marker = release_marker
+
+        self.evidence_url = evidence_url
+        self.release_condition = release_condition
+
         self.status = "CREATED"
 
     @gl.public.write.payable
     def fund(self) -> None:
-        if gl.message.sender_address != self.depositor:
-            raise gl.vm.UserError("ONLY_DEPOSITOR_CAN_FUND")
+        require(
+            self.status == "CREATED",
+            "ESCROW_ALREADY_FUNDED"
+        )
 
-        if self.status != "CREATED":
-            raise gl.vm.UserError("ESCROW_ALREADY_FUNDED_OR_SETTLED")
+        require(
+            gl.message.sender_address == self.depositor,
+            "ONLY_DEPOSITOR_CAN_FUND"
+        )
 
-        if gl.message.value != self.amount:
-            raise gl.vm.UserError("INCORRECT_ESCROW_AMOUNT")
+        require(
+            gl.message.value == self.amount,
+            "INCORRECT_ESCROW_AMOUNT"
+        )
 
         self.status = "FUNDED"
 
-    def _verify_release_condition(self) -> bool:
-        url = self.release_url
-        marker = self.release_marker
+    def _adjudicate(self) -> str:
+        url = self.evidence_url
+        condition = self.release_condition
 
-        def check_evidence():
-            page = gl.nondet.web.get(url)
-            body = page.body.decode("utf-8")
-            return marker.lower() in body.lower()
+        def evaluate() -> str:
+            try:
+                page = gl.nondet.web.render(
+                    url,
+                    mode="text"
+                )
 
-        return gl.eq_principle.strict_eq(check_evidence)
+                content = page[:6000] if page else ""
 
-    @gl.public.write
-    def release(self) -> None:
-        if gl.message.sender_address != self.beneficiary:
-            raise gl.vm.UserError("ONLY_BENEFICIARY_CAN_RELEASE")
+            except Exception:
+                content = "[FETCH_FAILED]"
 
-        if self.status != "FUNDED":
-            raise gl.vm.UserError("ESCROW_NOT_FUNDED")
+            prompt = f"""
+You are the adjudicator for an escrow contract.
 
-        if self.balance != self.amount:
-            raise gl.vm.UserError("ESCROW_BALANCE_INVARIANT_FAILED")
+RELEASE CONDITION:
+{condition}
 
-        if not self._verify_release_condition():
-            raise gl.vm.UserError("RELEASE_CONDITION_NOT_VERIFIED")
+EVIDENCE SOURCE:
+{url}
 
-        Recipient(self.beneficiary).emit_transfer(
-            value=self.amount,
+EVIDENCE:
+---
+{content}
+---
+
+Determine whether the evidence establishes that the release condition
+has been satisfied.
+
+Use exactly one outcome:
+
+RELEASE
+REFUND
+UNRESOLVED
+
+Rules:
+
+RELEASE means the evidence clearly establishes the condition.
+
+REFUND means the evidence clearly establishes that the condition has not
+been satisfied.
+
+UNRESOLVED means the evidence is missing, contradictory, insufficient or
+cannot establish either conclusion.
+
+A failed web fetch must be treated as UNRESOLVED.
+
+Do not guess.
+
+Return ONLY JSON:
+
+{{
+  "outcome": "RELEASE" | "REFUND" | "UNRESOLVED",
+  "reason": "one short factual explanation"
+}}
+"""
+
+            raw = gl.nondet.exec_prompt(prompt)
+
+            result = parse_json_response(raw)
+
+            outcome = str(
+                result.get("outcome", "")
+            ).upper()
+
+            if outcome not in (
+                "RELEASE",
+                "REFUND",
+                "UNRESOLVED",
+            ):
+                outcome = "UNRESOLVED"
+
+            return json.dumps(
+                {
+                    "outcome": outcome
+                },
+                sort_keys=True
+            )
+
+        principle = """
+Both validators independently evaluate the same escrow release
+condition using the same evidence source.
+
+The `outcome` field is the only action-driving field.
+
+Results are equivalent only when their outcome is exactly the same:
+RELEASE, REFUND or UNRESOLVED.
+
+Reason text must be ignored.
+"""
+
+        agreed = gl.eq_principle.prompt_comparative(
+            evaluate,
+            principle
         )
 
-        self.status = "RELEASED"
+        result = parse_json_response(agreed)
 
-    @gl.public.write
-    def refund(self) -> None:
-        if gl.message.sender_address != self.depositor:
-            raise gl.vm.UserError("ONLY_DEPOSITOR_CAN_REFUND")
+        outcome = str(
+            result.get("outcome", "")
+        ).upper()
 
-        if self.status != "FUNDED":
-            raise gl.vm.UserError("ESCROW_NOT_REFUNDABLE")
-
-        if self.balance != self.amount:
-            raise gl.vm.UserError("ESCROW_BALANCE_INVARIANT_FAILED")
-
-        if self._verify_release_condition():
-            raise gl.vm.UserError("RELEASE_CONDITION_IS_VERIFIED")
-
-        Recipient(self.depositor).emit_transfer(
-            value=self.amount,
+        require(
+            outcome in (
+                "RELEASE",
+                "REFUND",
+                "UNRESOLVED",
+            ),
+            "INVALID_CONSENSUS_OUTCOME"
         )
 
-        self.status = "REFUNDED"
+        return outcome
+
+    @gl.public.write
+    def adjudicate(self) -> str:
+        require(
+            self.status == "FUNDED",
+            "ESCROW_NOT_FUNDED"
+        )
+
+        require(
+            self.balance == self.amount,
+            "ESCROW_BALANCE_INVARIANT_FAILED"
+        )
+
+        outcome = self._adjudicate()
+
+        if outcome == "RELEASE":
+            self.status = "RELEASED"
+
+            self.claimable[self.beneficiary] = u256(
+                int(
+                    self.claimable.get(
+                        self.beneficiary,
+                        u256(0)
+                    )
+                ) + int(self.amount)
+            )
+
+        elif outcome == "REFUND":
+            self.status = "REFUNDED"
+
+            self.claimable[self.depositor] = u256(
+                int(
+                    self.claimable.get(
+                        self.depositor,
+                        u256(0)
+                    )
+                ) + int(self.amount)
+            )
+
+        return outcome
+
+    @gl.public.write
+    def withdraw(self) -> u256:
+        require(
+            self.status in (
+                "RELEASED",
+                "REFUNDED",
+            ),
+            "ESCROW_NOT_SETTLED"
+        )
+
+        recipient = gl.message.sender_address
+
+        amount = self.claimable.get(
+            recipient,
+            u256(0)
+        )
+
+        require(
+            amount > u256(0),
+            "NOTHING_TO_WITHDRAW"
+        )
+
+        self.claimable[recipient] = u256(0)
+
+        send_native(
+            recipient,
+            amount
+        )
+
+        return amount
 
     @gl.public.view
     def get_status(self) -> str:
@@ -123,3 +310,13 @@ class EscrowPrimitive(gl.Contract):
     @gl.public.view
     def get_beneficiary(self) -> Address:
         return self.beneficiary
+
+    @gl.public.view
+    def get_claimable(
+        self,
+        account: Address
+    ) -> u256:
+        return self.claimable.get(
+            account,
+            u256(0)
+        )
